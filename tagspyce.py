@@ -46,8 +46,7 @@ class MarginLoss(torch.nn.Module):
     def forward(self, xs, ys, ynegs):
         crude = self._sim(xs, ynegs) - self._sim(xs, ys) + self.margin
         if crude <= 0.0:
-            dprint("zero loss example!")
-        dprint("Loss: {}".format(crude))
+            return torch.tensor(0.0, device=crude.device, requires_grad=True)
         return crude
 
 class WordModel(torch.nn.Module):
@@ -103,6 +102,7 @@ def main(argv):
     print("training!")
     optim = torch.optim.Adam(wm.parameters(), lr=1e-3)
     wm.train()
+    example = 0
     for line in text.splitlines():
         optim.zero_grad()
         words = line.split()
@@ -110,7 +110,9 @@ def main(argv):
         ys = project(wd, words[-1:])
         negs = torch.randint(0, word_dict_len, size=(120,))
         loss = wm.forward(xs, ys, negs)
-        print("loss {}".format(loss))
+        example += 1
+        if (example % 100) == 1:
+            print("loss {}".format(loss))
         loss.backward()
         optim.step()
 
