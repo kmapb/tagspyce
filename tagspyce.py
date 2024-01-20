@@ -2,7 +2,10 @@
 import sys
 import torch
 from stringzilla import Str, File
+from datasets import load_dataset
 import os
+import sqlite3
+from progress.bar import Bar
 
 def dprint(str):
     if os.getenv('DBG'):
@@ -17,10 +20,8 @@ class WordDict:
     def get(self, word):
         #dprint("get {}".format(str(word)))
         if word in self.word_2_idx:
-            #dprint("hit {} -> {}".format(str(word), self.word_2_idx[word]))
             return self.word_2_idx[word]
         if self.num_words == self.max_words:
-            dprint("capacity miss {}".format(str(word), self.word_2_idx[word]))
             return None
         dprint("fill miss {} -> {}".format(str(word), self.num_words))
         self.word_2_idx[word] = self.num_words
@@ -49,7 +50,7 @@ class MarginLoss(torch.nn.Module):
             return torch.tensor(0.0, device=crude.device, requires_grad=True)
         return crude
 
-class WordModel(torch.nn.Module):
+class TagSpaceModel(torch.nn.Module):
     def __init__(self, dict_size, emb_size, margin=1e-1):
         torch.nn.Module.__init__(self)
         self.dict_size = dict_size
@@ -57,11 +58,6 @@ class WordModel(torch.nn.Module):
         self.word_embs = torch.nn.Embedding(dict_size, emb_size)
         self.tag_embs = torch.nn.Embedding(dict_size, emb_size)
         self.margin = MarginLoss(margin)
-
-    def _search_violators(xs, sim, max_probes):
-        indices = torch.randint(0, self.dict_size, (max_probes,))
-        ys = self.word_embs.forward(indices)
-        sims = self._sim(xs, ys)
 
     def forward(self, idx, targets_pos, targets_neg):
         # Get a sparse set of vectors for keys, targets
@@ -82,39 +78,55 @@ class WordModel(torch.nn.Module):
         return self.margin(xs, ys, negs)
 
 def project(wd, words):
-    first_pass = [ wd.get(word) for word in words]
-    f = [ f for f in filter(lambda x: x is not None, first_pass) ]
-    return torch.LongTensor(f)
+    try:
+        tagless = list(filter(lambda s: len(s) > 0 and s[0] != '#', words))
+        tokenized = [ wd.get(word) for word in tagless ]
+        f = [ f for f in filter(lambda x: x is not None, tokenized) ]
+        return torch.LongTensor(f)
+    except:
+        import pdb; pdb.set_trace()
 
 def main(argv):
     word_dict_len = int(1e5)
+    tag_dict_len = int(1e5)
     word_dim = 128
 
-    text = Str(File(argv[1]))
-
     wd = WordDict(word_dict_len)
-    wm = WordModel(word_dict_len, word_dim)
-    negatives = 0
-    positives = 0
-    lines = 0
-    words = 0
+    tagd = WordDict(tag_dict_len)
+    model = TagSpaceModel(word_dict_len, word_dim)
 
-    print("training!")
-    optim = torch.optim.Adam(wm.parameters(), lr=1e-3)
-    wm.train()
+    print("opening the DB!")
+    conn = sqlite3.connect(sys.argv[1])
+    cursor = conn.execute('SELECT count(1) from tweets;')
+    count = cursor.fetchone()[0]
+
+    cursor = conn.execute("SELECT * FROM tweets")
+    optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model.train()
+    model = model.cuda()
     example = 0
-    for line in text.splitlines():
-        optim.zero_grad()
-        words = line.split()
-        xs = project(wd, words[:-1])
-        ys = project(wd, words[-1:])
-        negs = torch.randint(0, word_dict_len, size=(120,))
-        loss = wm.forward(xs, ys, negs)
-        example += 1
-        if (example % 100) == 1:
-            print("loss {}".format(loss))
-        loss.backward()
-        optim.step()
+
+    with Bar('training', max=count) as bar:
+        for row in cursor:
+            bar.next()
+            assert len(row) == 3
+            text = row[1]
+            words = text.split()
+
+            hashtag_str = row[2]
+            hashtags = hashtag_str.split(',')
+            xs = project(wd, words).cuda()
+            ys = project(tagd, hashtags).cuda()
+
+            optim.zero_grad()
+            negs = torch.randint(0, tagd.num_words, size=(120,)).cuda()
+            loss = model.forward(xs, ys, negs)
+            example += 1
+            if (example % 100) == 1:
+                print("loss {} words {} tags {}".format(loss, wd.num_words, tagd.num_words))
+            loss.backward()
+            optim.step()
+    torch.save(model.state_dict(), 'model.pt')
 
 if __name__ == '__main__':
     main(sys.argv)
