@@ -1,11 +1,13 @@
 # Train a simple model on a collection of hashtagged data.
 import sys
 import torch
+import torch.nn.functional as F
 from stringzilla import Str, File
 from datasets import load_dataset
 import os
 import sqlite3
 from progress.bar import Bar
+from typing import Optional
 
 def dprint(str):
     if os.getenv('DBG'):
@@ -14,6 +16,7 @@ def dprint(str):
 class WordDict:
     def __init__(self, max_words):
         self.word_2_idx = {}
+        self.idx_2_word = []
         self.max_words = max_words
         self.num_words = 0
 
@@ -23,8 +26,9 @@ class WordDict:
             return self.word_2_idx[word]
         if self.num_words == self.max_words:
             return None
-        dprint("fill miss {} -> {}".format(str(word), self.num_words))
+        #dprint("fill miss {} -> {}".format(str(word), self.num_words))
         self.word_2_idx[word] = self.num_words
+        self.idx_2_word.append(word)
         self.num_words += 1
         assert self.has(word)
         return self.num_words - 1
@@ -34,9 +38,13 @@ class WordDict:
 
     def encode(self, words):
         return torch.Tensor([self.get(word) for word in words], dtype=torch.long)        
+    
+    def decode(self, indices):
+        return [self.idx_2_word[idx] for idx in indices]
 
 class MarginLoss(torch.nn.Module):
-    def __init__(self, margin=1e-1):
+    def __init__(self,
+                 margin=1e-1):
         torch.nn.Module.__init__(self)
         self.cosine = torch.nn.CosineSimilarity(dim=0)
         self.margin = margin
@@ -51,13 +59,41 @@ class MarginLoss(torch.nn.Module):
         return crude
 
 class TagSpaceModel(torch.nn.Module):
-    def __init__(self, dict_size, emb_size, margin=1e-1):
+    def __init__(self,
+                 emb_size=256,
+                 words: Optional[WordDict]=None,
+                 tags: Optional[WordDict]=None,
+                 vocab_size=int(1e6),
+                 tag_vocab_size=int(1e5),
+                 margin=1e-1):
         torch.nn.Module.__init__(self)
-        self.dict_size = dict_size
         self.emb_size = emb_size 
-        self.word_embs = torch.nn.Embedding(dict_size, emb_size)
-        self.tag_embs = torch.nn.Embedding(dict_size, emb_size)
+
+        words = words or WordDict(vocab_size)
+        tags = tags or WordDict(tag_vocab_size)
+        self.words = words
+        self.tags = tags
+
+        self.word_embs = torch.nn.Embedding(vocab_size, emb_size)
+        self.tag_embs = torch.nn.Embedding(tag_vocab_size, emb_size)
         self.margin = MarginLoss(margin)
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
+
+    def _project(self, wd, tokens):
+        try:
+            tagless = list(filter(lambda s: len(s) > 0 and s[0] != '#', tokens))
+            tokenized = [ wd.get(word) for word in tagless ]
+            f = [ f for f in filter(lambda x: x is not None, tokenized) ]
+            return torch.LongTensor(f).to(self.device)
+        except:
+            import pdb; pdb.set_trace()
+
+    def project_example(self, words, tags):
+        idx = self._project(self.words, words)
+        targets_pos = self._project(self.tags, tags)
+        targets_neg = torch.randint(0, self.tags.num_words, size=(32,)).to(self.device)
+        return (idx, targets_pos, targets_neg)
 
     def forward(self, idx, targets_pos, targets_neg):
         # Get a sparse set of vectors for keys, targets
@@ -76,24 +112,21 @@ class TagSpaceModel(torch.nn.Module):
         assert negs.shape == (self.emb_size,)
 
         return self.margin(xs, ys, negs)
-
-def project(wd, words):
-    try:
-        tagless = list(filter(lambda s: len(s) > 0 and s[0] != '#', words))
-        tokenized = [ wd.get(word) for word in tagless ]
-        f = [ f for f in filter(lambda x: x is not None, tokenized) ]
-        return torch.LongTensor(f)
-    except:
-        import pdb; pdb.set_trace()
+    
+    def load_dictionaries(self, embs):
+        self.words = embs['words']
+        self.tags = embs['tags']
+ 
+    def embed_words(self, words):
+        wordvecs = self.word_embs.forward(self._project(self.words, words))
+        return torch.einsum('ij->j', wordvecs)
+    
+    def search_tags(self, vector):
+        sims = F.cosine_similarity(vector, self.tag_embs.weight)
+        return sims
 
 def main(argv):
-    word_dict_len = int(1e5)
-    tag_dict_len = int(1e5)
-    word_dim = 128
-
-    wd = WordDict(word_dict_len)
-    tagd = WordDict(tag_dict_len)
-    model = TagSpaceModel(word_dict_len, word_dim)
+    model = TagSpaceModel()
 
     print("opening the DB!")
     conn = sqlite3.connect(sys.argv[1])
@@ -115,18 +148,22 @@ def main(argv):
 
             hashtag_str = row[2]
             hashtags = hashtag_str.split(',')
-            xs = project(wd, words).cuda()
-            ys = project(tagd, hashtags).cuda()
+            xs, ys, negs = model.project_example(words, hashtags)
 
             optim.zero_grad()
-            negs = torch.randint(0, tagd.num_words, size=(120,)).cuda()
             loss = model.forward(xs, ys, negs)
             example += 1
             if (example % 100) == 1:
-                print("loss {} words {} tags {}".format(loss, wd.num_words, tagd.num_words))
+                print("loss {} words {} tags {}".format(loss, model.words.num_words, model.tags.num_words))
             loss.backward()
             optim.step()
-    torch.save(model.state_dict(), 'model.pt')
+    torch.save({
+        'model_state': model.state_dict(),
+        'dictionaries': {
+            'words' : model.words,
+            'tags'  : model.tags,
+        },
+    }, 'model.pt')
 
 if __name__ == '__main__':
     main(sys.argv)

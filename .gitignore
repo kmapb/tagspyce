@@ -1,3 +1,6 @@
 data/*
+.hypothesis/*
+__pycache__/*
 *.swp
 tweets.sqlite3
+model.pt
