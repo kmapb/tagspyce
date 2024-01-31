@@ -9,7 +9,6 @@ def main(argv):
     model = TagSpaceModel()
     checkpoint = torch.load(argv[0])
     model.load_state_dict(checkpoint['model_state'])
-    import pdb; pdb.set_trace()
     model.load_dictionaries(checkpoint['dictionaries'])
     while True:
         s = split_and_normalize(input('** '))
@@ -18,7 +17,6 @@ def main(argv):
         k = 5
         top_sims, indices = torch.topk(sims, k)
         for i in range(k):
-            import pdb; pdb.set_trace()
             print("{}: {}".format(model.tags.decode([indices[i]]), sims[i]))
 
 if __name__ == '__main__':
